@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: docverify-api
+    runtime: python
+    region: frankfurt
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+      - key: CONFIDENCE_HITL_THRESHOLD
+        value: 75
+      - key: CONFIDENCE_REVIEW_THRESHOLD
+        value: 90
+      - key: LOG_LEVEL
+        value: INFO
+      - key: GROQ_PRIMARY_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_FALLBACK_MODEL
+        value: llama-3.1-8b-instant
+      - key: GROQ_TIMEOUT
+        value: 30

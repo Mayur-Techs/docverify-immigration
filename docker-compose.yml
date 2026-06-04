@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docverify
+      POSTGRES_PASSWORD: docverify
+      POSTGRES_DB: docverify
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docverify"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - backend/.env
+    environment:
+      DATABASE_URL: postgresql://docverify:docverify@db:5432/docverify
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - uploads:/tmp/docverify
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  uploads:
