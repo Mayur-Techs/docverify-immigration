@@ -42,12 +42,21 @@ async def process_document(doc_id: int) -> None:
             _map_fields(doc, fmap)
 
             for f in result.fields:
+                flags_json = None
+                if f.validation_flags:
+                    flags_json = json.dumps([{
+                        "severity": fl.severity,
+                        "reason": fl.reason,
+                        "action": fl.suggested_action,
+                    } for fl in f.validation_flags])
                 db.add(ExtractedField(
                     document_id=doc_id,
                     field_name=f.field_name,
                     field_value=str(f.field_value) if f.field_value is not None else None,
                     confidence=f.confidence,
                     page_number=_safe_int(f.page_hint),
+                    validation_flags_json=flags_json,
+                    validation_severity=f.validation_severity or "",
                 ))
 
             if result.hitl_required:
@@ -56,7 +65,9 @@ async def process_document(doc_id: int) -> None:
                 db.add(HITLQueueItem(
                     document_id=doc_id,
                     reason=(f"Confidence {int(result.overall_confidence * 100)}% below threshold. "
-                            f"{len(flagged)} field(s) flagged."),
+                            f"{len(flagged)} field(s) flagged. "
+                            f"Validation: {result.validation_error_count} error(s), "
+                            f"{result.validation_warning_count} warning(s)."),
                     priority=_priority(result.overall_confidence),
                     flagged_fields=json.dumps(flagged),
                     overall_confidence=result.overall_confidence,

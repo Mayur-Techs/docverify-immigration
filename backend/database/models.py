@@ -102,6 +102,8 @@ class ExtractedField(Base):
     verified_at = Column(DateTime(timezone=True))
     original_value = Column(Text)
     page_number = Column(Integer)
+    validation_flags_json = Column(Text)       # JSON list of {severity, reason, action}
+    validation_severity = Column(String(20))   # "error" | "warning" | ""
     document = relationship("Document", back_populates="fields")
 
 
@@ -120,3 +122,7 @@ class HITLQueueItem(Base):
     is_resolved = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     document = relationship("Document", back_populates="hitl_items")
+
+# NOTE: Run alembic migration after adding these columns
+# alembic revision --autogenerate -m "add validation fields"
+# alembic upgrade head

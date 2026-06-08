@@ -174,10 +174,11 @@ def get_doc(doc_id: int, db: Session = Depends(get_db), user: User = Depends(get
     return _or_404(doc_id, db, user)
 
 
-@router.get("/{doc_id}/fields", response_model=list[FieldOut])
+@router.get("/{doc_id}/fields")
 def get_fields(doc_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _or_404(doc_id, db, user)
-    return db.query(ExtractedField).filter(ExtractedField.document_id == doc_id).all()
+    raw = db.query(ExtractedField).filter(ExtractedField.document_id == doc_id).all()
+    return [FieldOut.from_orm_with_flags(f) for f in raw]
 
 
 @router.patch("/{doc_id}/fields/{fid}/verify")
