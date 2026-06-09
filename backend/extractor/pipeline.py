@@ -21,6 +21,13 @@ settings = get_settings()
 
 
 async def process_document(doc_id: int) -> None:
+    from app import get_semaphore
+    sem = get_semaphore()
+    async with sem:
+        await _process(doc_id)
+
+
+async def _process(doc_id: int) -> None:
     """
     Full pipeline:
       1. Load document path from DB

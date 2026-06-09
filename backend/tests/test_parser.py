@@ -53,9 +53,11 @@ def test_pymupdf_fallback():
         f.write(b"%PDF-1.4")
         path = f.name
     try:
+        import unittest.mock as _um
         with patch("pdfplumber.open", side_effect=Exception("corrupt")):
-            with patch("parser.extractor.fitz") as mock_fitz:
-                mock_fitz.open.return_value = mock_doc
+            mock_fitz_mod = _um.MagicMock()
+            mock_fitz_mod.open.return_value = mock_doc
+            with patch.dict("sys.modules", {"fitz": mock_fitz_mod}):
                 result = extract_text(path)
         assert result.method == "pymupdf"
         assert result.success

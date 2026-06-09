@@ -1,110 +1,86 @@
+import gc
 import logging
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from config import get_settings
-from database.connection import init_db, engine
-from api.routes import auth, documents
+
+from fastapi import FastAPI
+from fastapi import Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+
+from api.routes import auth
+from api.routes import documents
+from config import get_settings
+from database.connection import engine
+from database.connection import init_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docverify")
 settings = get_settings()
 
+# ── Semaphore: max 2 documents processed at the same time ─────────────────────
+# Each processing job uses ~150-200MB. Free tier has 512MB.
+# 2 concurrent = ~400MB peak. Keeps us inside the limit.
+import asyncio  # noqa: E402
+_processing_semaphore = asyncio.Semaphore(2)
+
+
+def get_semaphore() -> asyncio.Semaphore:
+    return _processing_semaphore
+
 
 def run_safe_migrations() -> None:
-    """
-    Add new columns if they don't exist.
-    Uses IF NOT EXISTS syntax — safe to run on every startup.
-    Works on both SQLite (dev) and PostgreSQL (production).
-    Never fails if columns already exist.
-    """
     is_sqlite = settings.database_url.startswith("sqlite")
-
-    migrations = []
-
     if is_sqlite:
-        # SQLite does not support IF NOT EXISTS for ALTER TABLE
-        # Check column existence manually
-        migrations = [
+        checks = [
             ("extracted_fields", "validation_flags_json", "TEXT",
              "SELECT COUNT(*) FROM pragma_table_info('extracted_fields') WHERE name='validation_flags_json'"),
             ("extracted_fields", "validation_severity", "VARCHAR(20) DEFAULT ''",
              "SELECT COUNT(*) FROM pragma_table_info('extracted_fields') WHERE name='validation_severity'"),
         ]
         with engine.connect() as conn:
-            for table, col, col_type, check_sql in migrations:
+            for table, col, col_type, check_sql in checks:
                 try:
-                    result = conn.execute(text(check_sql))
-                    exists = result.scalar()
+                    exists = conn.execute(text(check_sql)).scalar()
                     if not exists:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
                         conn.commit()
-                        logger.info("Migration: added column %s.%s", table, col)
-                    else:
-                        logger.info("Migration: column %s.%s already exists — skipped", table, col)
-                except Exception as e:
-                    logger.warning("Migration check skipped: %s", e)
+                        logger.info("Migration: added %s.%s", table, col)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Migration skipped: %s", e)
     else:
-        # PostgreSQL supports DO $$ blocks for safe conditional migrations
-        pg_migrations = [
-            """
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='extracted_fields'
-                    AND column_name='validation_flags_json'
-                ) THEN
-                    ALTER TABLE extracted_fields ADD COLUMN validation_flags_json TEXT;
-                    RAISE NOTICE 'Added column validation_flags_json';
-                END IF;
-            END $$;
-            """,
-            """
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='extracted_fields'
-                    AND column_name='validation_severity'
-                ) THEN
-                    ALTER TABLE extracted_fields ADD COLUMN validation_severity VARCHAR(20) DEFAULT '';
-                    RAISE NOTICE 'Added column validation_severity';
-                END IF;
-            END $$;
-            """,
+        pg = [
+            """DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_name='extracted_fields' AND column_name='validation_flags_json')
+                THEN ALTER TABLE extracted_fields ADD COLUMN validation_flags_json TEXT; END IF;
+            END $$;""",
+            """DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_name='extracted_fields' AND column_name='validation_severity')
+                THEN ALTER TABLE extracted_fields ADD COLUMN validation_severity VARCHAR(20) DEFAULT ''; END IF;
+            END $$;""",
         ]
         with engine.connect() as conn:
-            for sql in pg_migrations:
+            for sql in pg:
                 try:
                     conn.execute(text(sql))
                     conn.commit()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.warning("Migration skipped: %s", e)
-
     logger.info("Migrations complete")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting DocVerify AI — env=%s model=%s hitl_threshold=%d%%",
-                settings.environment, settings.groq_primary_model,
-                settings.confidence_hitl_threshold)
-    init_db()                  # creates tables if they don't exist
-    run_safe_migrations()      # adds new columns if they don't exist
-    logger.info("Database ready")
+    init_db()
+    run_safe_migrations()
+    logger.info("DocVerify AI ready — env=%s model=%s", settings.environment, settings.groq_primary_model)
     yield
-    logger.info("Shutting down")
+    gc.collect()
 
 
-app = FastAPI(
-    title="DocVerify AI",
-    description="Immigration document extraction with confidence scoring, "
-                "validation engine, and HITL routing.",
-    version="1.1.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="DocVerify AI", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,13 +94,23 @@ app.include_router(auth.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 
 
+@app.exception_handler(MemoryError)
+async def memory_error_handler(request: Request, exc: MemoryError):
+    gc.collect()
+    logger.error("MemoryError on %s", request.url)
+    return JSONResponse(status_code=503, content={
+        "detail": "Server is processing other documents. Please retry in 30 seconds.",
+    })
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "environment": settings.environment,
         "model": settings.groq_primary_model,
         "hitl_threshold": f"{settings.confidence_hitl_threshold}%",
         "validation_rules": 12,
+        "max_concurrent_processing": 2,
     }

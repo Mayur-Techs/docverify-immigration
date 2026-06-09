@@ -1,15 +1,11 @@
 from __future__ import annotations
+import gc
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    import fitz  # pymupdf
-except ImportError:
-    fitz = None
-
 logger = logging.getLogger("docverify.parser")
-MAX_CHARS = 12_000
+MAX_CHARS = 8_000  # reduced from 12k — saves ~50MB per request
 
 
 @dataclass
@@ -39,32 +35,57 @@ def _try_pdfplumber(path: Path) -> ParseResult:
     try:
         import pdfplumber
         pages_text = []
+        chars_so_far = 0
         with pdfplumber.open(str(path)) as pdf:
             count = len(pdf.pages)
             for page in pdf.pages:
+                if chars_so_far >= MAX_CHARS:
+                    break
                 t = page.extract_text() or ""
-                for table in (page.extract_tables() or []):
-                    for row in table:
-                        t += "\n" + " | ".join(str(c) for c in row if c)
+                # Skip table extraction on large docs to save memory
+                if chars_so_far + len(t) < MAX_CHARS - 1000:
+                    for table in (page.extract_tables() or []):
+                        for row in table:
+                            t += "\n" + " | ".join(str(c) for c in row if c)
                 pages_text.append(t)
+                chars_so_far += len(t)
         full = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
         raw = len(full)
-        return ParseResult(success=True, text=full[:MAX_CHARS], page_count=count,
-                           raw_length=raw, truncated=raw > MAX_CHARS, method="pdfplumber")
+        result = ParseResult(
+            success=True, text=full[:MAX_CHARS], page_count=count,
+            raw_length=raw, truncated=raw > MAX_CHARS, method="pdfplumber",
+        )
+        del pages_text, full
+        gc.collect()
+        return result
     except Exception as e:
+        gc.collect()
         return ParseResult(success=False, error=str(e), method="pdfplumber")
 
 
 def _try_pymupdf(path: Path) -> ParseResult:
     try:
-        if fitz is None:
-            return ParseResult(success=False, error="pymupdf not installed", method="pymupdf")
+        import fitz  # noqa: PLC0415
         doc = fitz.open(str(path))
-        pages = [p.get_text("text") for p in doc]
+        pages = []
+        chars_so_far = 0
+        for page in doc:
+            if chars_so_far >= MAX_CHARS:
+                break
+            t = page.get_text("text")
+            pages.append(t)
+            chars_so_far += len(t)
         doc.close()
+        del doc
         full = "\n\n--- PAGE BREAK ---\n\n".join(pages)
         raw = len(full)
-        return ParseResult(success=True, text=full[:MAX_CHARS], page_count=len(pages),
-                           raw_length=raw, truncated=raw > MAX_CHARS, method="pymupdf")
+        result = ParseResult(
+            success=True, text=full[:MAX_CHARS], page_count=len(pages),
+            raw_length=raw, truncated=raw > MAX_CHARS, method="pymupdf",
+        )
+        del pages, full
+        gc.collect()
+        return result
     except Exception as e:
+        gc.collect()
         return ParseResult(success=False, error=str(e), method="pymupdf")
