@@ -5,22 +5,25 @@ Catches bad dates, wrong formats, logical contradictions, impossible values.
 Every problem found LOWERS the confidence score and adds a specific flag reason.
 """
 from __future__ import annotations
-import re
+
 import logging
-from datetime import datetime, date
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import date
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger("docverify.validator")
 
-# ── Minimum H-1B prevailing wage (DOL 2024) ──────────────
-H1B_MIN_WAGE_ANNUAL = 60_000   # $60k absolute floor
-H1B_MIN_WAGE_HOURLY = 28.0
+# ── Minimum H-1B prevailing wage (DOL 2024) ───────────────────────────────────
+H1B_MIN_WAGE_ANNUAL = 60_000
+IMPLAUSIBLY_LOW_WAGE = 15_000
 
-# ── Countries that are real — basic check ────────────────
-OBVIOUSLY_BAD_COUNTRY = re.compile(r'\d')  # any digit in a country name = wrong
+# ── Countries: no digit should appear in a country name ───────────────────────
+OBVIOUSLY_BAD_COUNTRY = re.compile(r"\d")
 
-# ── Valid visa classifications ────────────────────────────
+# ── Canonical visa classifications ────────────────────────────────────────────
 VALID_VISA_CLASSIFICATIONS = {
     "H-1B", "H-1B1", "H-2A", "H-2B", "H-3",
     "L-1A", "L-1B", "L-1",
@@ -30,17 +33,34 @@ VALID_VISA_CLASSIFICATIONS = {
     "F-1", "J-1", "B-1", "B-2",
 }
 
-# ── FEIN format: XX-XXXXXXX ───────────────────────────────
-FEIN_RE = re.compile(r'^\d{2}-\d{7}$')
+# ── FEIN must be XX-XXXXXXX ───────────────────────────────────────────────────
+FEIN_RE = re.compile(r"^\d{2}-\d{7}$")
 
-# ── US passport: 9 digits, UK: 9 alphanumeric, Indian: 1 letter + 7 digits
-PASSPORT_BAD = re.compile(r'\s')  # spaces inside passport number = wrong
+# ── Any whitespace inside a passport number is wrong ──────────────────────────
+PASSPORT_HAS_SPACE = re.compile(r"\s")
+
+# ── Normalise visa strings like "H1B" → "H-1B", "L1A" → "L-1A" ──────────────
+# Only insert hyphen when a letter group is immediately followed by a digit
+# e.g. H1B → H-1B   but   H-1B stays H-1B   and   F1 → F-1 (checked below)
+VISA_NORMALISE_RE = re.compile(r"^([A-Za-z]+)(\d)")
+
+
+def _normalise_visa(raw: str) -> str:
+    """Insert hyphen between leading letters and first digit if missing."""
+    cleaned = raw.strip().upper()
+    # Already has a hyphen in the right place — leave it
+    if "-" in cleaned:
+        return cleaned
+    m = VISA_NORMALISE_RE.match(cleaned)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}{cleaned[m.end():]}"
+    return cleaned
 
 
 @dataclass
 class ValidationFlag:
     field_name: str
-    severity: str          # "error" | "warning" | "info"
+    severity: str           # "error" | "warning"
     reason: str
     original_value: str
     suggested_action: str
@@ -49,10 +69,17 @@ class ValidationFlag:
 @dataclass
 class ValidationResult:
     flags: list[ValidationFlag] = field(default_factory=list)
-    overall_penalty: float = 0.0   # 0.0–1.0, subtracted from confidence
+    overall_penalty: float = 0.0    # subtracted from average confidence
 
-    def add(self, field_name: str, severity: str, reason: str,
-            original_value: str, action: str, penalty: float = 0.0):
+    def add(
+        self,
+        field_name: str,
+        severity: str,
+        reason: str,
+        original_value: str,
+        action: str,
+        penalty: float = 0.0,
+    ) -> None:
         self.flags.append(ValidationFlag(
             field_name=field_name,
             severity=severity,
@@ -71,15 +98,23 @@ class ValidationResult:
         return [f.field_name for f in self.flags if f.severity == "error"]
 
 
-def validate_extraction(fields: dict[str, str | None]) -> ValidationResult:
+# ── Skip sentinel values returned by the LLM ──────────────────────────────────
+_EMPTY = {"not found", "null", "none", "n/a", "unknown", ""}
+
+
+def _is_empty(val: Optional[str]) -> bool:
+    return val is None or str(val).strip().lower() in _EMPTY
+
+
+def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     """
-    Run all validation checks against a dict of {field_name: field_value}.
-    Returns ValidationResult with every problem found.
+    Run all validation checks.
+    Returns ValidationResult listing every problem found.
     """
     vr = ValidationResult()
 
-    # ── 1. DATE FORMAT AND IMPOSSIBLE DATE VALUES ─────────
-    date_fields = [
+    # ── 1. DATE FORMAT AND IMPOSSIBLE CALENDAR VALUES ─────────────────────────
+    date_field_names = [
         "date_of_birth",
         "passport_issue_date",
         "passport_expiry_date",
@@ -89,212 +124,219 @@ def validate_extraction(fields: dict[str, str | None]) -> ValidationResult:
         "priority_date",
     ]
     parsed_dates: dict[str, Optional[date]] = {}
-    for fname in date_fields:
+    for fname in date_field_names:
         val = fields.get(fname)
-        if val and val.lower() not in ("not found", "null", "none", ""):
-            parsed, error = _parse_date(val)
-            parsed_dates[fname] = parsed
-            if parsed is None:
-                vr.add(fname, "error",
-                       f"Cannot parse date '{val}' — check for invalid month/day (e.g. month 13)",
-                       val,
-                       "Manually verify and correct the date",
-                       penalty=0.3)
-            else:
-                # Check for obviously impossible dates
-                if parsed.year < 1900 or parsed.year > 2100:
-                    vr.add(fname, "error",
-                           f"Year {parsed.year} is outside valid range",
-                           val, "Verify year is correct", penalty=0.3)
+        if _is_empty(val):
+            continue
+        parsed, _ = _parse_date(val)  # type: ignore[arg-type]
+        parsed_dates[fname] = parsed
+        if parsed is None:
+            vr.add(
+                fname, "error",
+                f"Cannot parse date '{val}' — check for invalid month/day (e.g. month 13)",
+                val,  # type: ignore[arg-type]
+                "Manually verify and correct the date",
+                penalty=0.3,
+            )
+        elif parsed.year < 1900 or parsed.year > 2100:
+            vr.add(
+                fname, "error",
+                f"Year {parsed.year} is outside valid range (1900–2100)",
+                val,  # type: ignore[arg-type]
+                "Verify the year is correct",
+                penalty=0.3,
+            )
 
-    # ── 2. PASSPORT EXPIRY BEFORE ISSUE ──────────────────
+    # ── 2. PASSPORT EXPIRY MUST BE AFTER ISSUE ───────────────────────────────
     issue = parsed_dates.get("passport_issue_date")
     expiry = parsed_dates.get("passport_expiry_date")
-    if issue and expiry:
-        if expiry <= issue:
-            vr.add("passport_expiry_date", "error",
-                   f"Passport expiry ({expiry}) is on or before issue date ({issue})"
-                   " — dates are swapped or corrupted",
-                   str(expiry),
-                   "Swap issue and expiry dates — they appear reversed",
-                   penalty=0.4)
+    if issue and expiry and expiry <= issue:
+        vr.add(
+            "passport_expiry_date", "error",
+            f"Passport expiry ({expiry}) is on or before issue date ({issue}) — dates are reversed",
+            str(expiry),
+            "Swap issue and expiry dates — they appear reversed",
+            penalty=0.4,
+        )
 
-    # ── 3. PASSPORT ALREADY EXPIRED ──────────────────────
-    if expiry:
-        today = date.today()
-        if expiry < today:
-            vr.add("passport_expiry_date", "warning",
-                   f"Passport expired on {expiry} — invalid for travel",
-                   str(expiry),
-                   "Client must renew passport before visa application proceeds",
-                   penalty=0.2)
+    # ── 3. PASSPORT ALREADY EXPIRED ──────────────────────────────────────────
+    if expiry and expiry < date.today():
+        vr.add(
+            "passport_expiry_date", "warning",
+            f"Passport expired on {expiry} — invalid for travel",
+            str(expiry),
+            "Client must renew passport before visa application proceeds",
+            penalty=0.2,
+        )
 
-    # ── 4. EMPLOYMENT END BEFORE START ───────────────────
+    # ── 4. EMPLOYMENT END MUST BE AFTER START ────────────────────────────────
     start = parsed_dates.get("validity_period_start")
     end = parsed_dates.get("validity_period_end")
-    if start and end:
-        if end <= start:
-            vr.add("validity_period_end", "error",
-                   f"Employment end date ({end}) is before or same as start date ({start})"
-                   " — dates are reversed",
-                   str(end),
-                   "Check petition dates — start and end appear swapped",
-                   penalty=0.4)
+    if start and end and end <= start:
+        vr.add(
+            "validity_period_end", "error",
+            f"Employment end date ({end}) is before or same as start date ({start})",
+            str(end),
+            "Check petition dates — start and end appear swapped",
+            penalty=0.4,
+        )
 
-    # ── 5. STATUS ALREADY EXPIRED ────────────────────────
+    # ── 5. IMMIGRATION STATUS EXPIRED OVER A YEAR AGO ───────────────────────
     status_exp = parsed_dates.get("status_expiry_date")
     if status_exp:
-        today = date.today()
-        years_ago = (today - status_exp).days / 365
+        years_ago = (date.today() - status_exp).days / 365
         if years_ago > 1:
-            vr.add("status_expiry_date", "warning",
-                   f"Immigration status expired {years_ago:.1f} years ago ({status_exp})"
-                   " — applicant may be out of status",
-                   str(status_exp),
-                   "Verify current immigration status with attorney — may affect eligibility",
-                   penalty=0.2)
+            vr.add(
+                "status_expiry_date", "warning",
+                f"Immigration status expired {years_ago:.1f} years ago ({status_exp})",
+                str(status_exp),
+                "Verify current status with attorney — applicant may be out of status",
+                penalty=0.2,
+            )
 
-    # ── 6. PASSPORT NUMBER FORMAT ────────────────────────
+    # ── 6. PASSPORT NUMBER MUST NOT CONTAIN SPACES ───────────────────────────
     passport = fields.get("passport_number")
-    if passport and passport.lower() not in ("not found", "null", "none", ""):
-        if PASSPORT_BAD.search(passport):
-            vr.add("passport_number", "error",
-                   f"Passport number '{passport}' contains spaces — "
-                   "spaces are not part of any passport number format",
-                   passport,
-                   "Remove spaces from passport number",
-                   penalty=0.3)
-        if len(passport) < 6 or len(passport) > 15:
-            vr.add("passport_number", "warning",
-                   f"Passport number '{passport}' has unusual length ({len(passport)} chars)"
-                   " — most passports are 8–9 characters",
-                   passport,
-                   "Verify passport number against physical document",
-                   penalty=0.15)
+    if not _is_empty(passport):
+        assert passport is not None  # for type checker after _is_empty
+        if PASSPORT_HAS_SPACE.search(passport):
+            vr.add(
+                "passport_number", "error",
+                f"Passport number '{passport}' contains spaces — no passport format includes spaces",
+                passport,
+                "Remove all spaces from the passport number",
+                penalty=0.3,
+            )
+        if not 6 <= len(passport.strip()) <= 15:
+            vr.add(
+                "passport_number", "warning",
+                f"Passport number '{passport}' has unusual length ({len(passport.strip())} chars)"
+                " — most are 8–9 characters",
+                passport,
+                "Verify against the physical document",
+                penalty=0.15,
+            )
 
-    # ── 7. VISA CLASSIFICATION FORMAT ────────────────────
+    # ── 7. VISA CLASSIFICATION FORMAT ────────────────────────────────────────
     visa = fields.get("visa_classification")
-    if visa and visa.lower() not in ("not found", "null", "none", ""):
-        visa_clean = visa.strip().upper()
-        # Normalise common OCR errors: H1B → H-1B, L1A → L-1A
-        normalised = re.sub(r'^([A-Z]+)(\d)', r'\1-\2', visa_clean)
+    if not _is_empty(visa):
+        assert visa is not None
+        normalised = _normalise_visa(visa)
         if normalised not in VALID_VISA_CLASSIFICATIONS:
-            vr.add("visa_classification", "error",
-                   f"'{visa}' is not a recognised visa classification. "
-                   f"Did you mean '{normalised}'?",
-                   visa,
-                   f"Correct to standard format e.g. 'H-1B' not 'H1B'",
-                   penalty=0.25)
-        elif visa_clean != normalised:
-            vr.add("visa_classification", "warning",
-                   f"'{visa}' should be formatted as '{normalised}'",
-                   visa,
-                   f"Correct to '{normalised}'",
-                   penalty=0.05)
+            vr.add(
+                "visa_classification", "error",
+                f"'{visa}' is not a recognised visa classification"
+                f" — closest match may be '{normalised}'",
+                visa,
+                "Correct to standard format e.g. 'H-1B' not 'H1B'",
+                penalty=0.25,
+            )
+        elif visa.strip().upper() != normalised:
+            # Recognised after normalisation — soft warning only
+            vr.add(
+                "visa_classification", "warning",
+                f"'{visa}' should be formatted as '{normalised}'",
+                visa,
+                f"Correct to '{normalised}'",
+                penalty=0.05,
+            )
 
-    # ── 8. WAGE SANITY CHECK ─────────────────────────────
-    visa_type = (fields.get("visa_classification") or "").upper().replace("-", "")
+    # ── 8. WAGE SANITY CHECK ─────────────────────────────────────────────────
+    visa_upper = (fields.get("visa_classification") or "").strip().upper()
     wage_raw = fields.get("annual_wage") or fields.get("salary")
-    if wage_raw and wage_raw.lower() not in ("not found", "null", "none", ""):
-        wage = _parse_wage(wage_raw)
-        if wage is not None:
-            if "H1B" in visa_type or "H-1B" in visa_type:
-                if wage < H1B_MIN_WAGE_ANNUAL:
-                    vr.add("annual_wage", "error",
-                           f"Annual wage ${wage:,.0f} is below the H-1B minimum prevailing "
-                           f"wage threshold of ${H1B_MIN_WAGE_ANNUAL:,}. "
-                           "This will fail DOL review.",
-                           str(wage_raw),
-                           "Verify wage — likely missing zeros (e.g. 8000 should be 80000)",
-                           penalty=0.4)
-            if wage < 15_000 and wage > 0:
-                vr.add("annual_wage", "error",
-                       f"Annual wage ${wage:,.0f} is implausibly low for any US work visa. "
-                       "Value may be missing digits.",
-                       str(wage_raw),
-                       "Verify — likely extracted incorrectly (e.g. 8000 instead of 80000)",
-                       penalty=0.35)
+    if not _is_empty(wage_raw):
+        wage = _parse_wage(wage_raw)  # type: ignore[arg-type]
+        if wage is not None and wage > 0:
+            is_h1b = "H-1B" in visa_upper or "H1B" in visa_upper
+            if is_h1b and wage < H1B_MIN_WAGE_ANNUAL:
+                vr.add(
+                    "annual_wage", "error",
+                    f"Wage ${wage:,.0f}/yr is below the H-1B DOL minimum of"
+                    f" ${H1B_MIN_WAGE_ANNUAL:,}. This will fail DOL review.",
+                    str(wage_raw),
+                    "Verify — likely missing zeros (e.g. 80000 not 8000)",
+                    penalty=0.4,
+                )
+            elif wage < IMPLAUSIBLY_LOW_WAGE:
+                vr.add(
+                    "annual_wage", "error",
+                    f"Wage ${wage:,.0f}/yr is implausibly low for any US work visa",
+                    str(wage_raw),
+                    "Verify — likely extracted incorrectly (missing digits)",
+                    penalty=0.35,
+                )
 
-    # ── 9. COUNTRY NAME CONTAINS DIGITS ──────────────────
-    for cfield in ["nationality", "country_of_citizenship", "country_of_birth"]:
+    # ── 9. COUNTRY NAMES MUST NOT CONTAIN DIGITS ─────────────────────────────
+    for cfield in ("nationality", "country_of_citizenship", "country_of_birth"):
         cval = fields.get(cfield)
-        if cval and cval.lower() not in ("not found", "null", "none", ""):
+        if not _is_empty(cval):
+            assert cval is not None
             if OBVIOUSLY_BAD_COUNTRY.search(cval):
-                vr.add(cfield, "error",
-                       f"Country name '{cval}' contains numbers — "
-                       "no valid country name contains digits",
-                       cval,
-                       "Remove digits — likely OCR error combining adjacent text",
-                       penalty=0.3)
+                vr.add(
+                    cfield, "error",
+                    f"Country name '{cval}' contains digits — no country name contains numbers",
+                    cval,
+                    "Remove digits — likely an OCR error merging adjacent fields",
+                    penalty=0.3,
+                )
 
-    # ── 10. FEIN FORMAT ───────────────────────────────────
+    # ── 10. FEIN FORMAT: XX-XXXXXXX ──────────────────────────────────────────
     fein = fields.get("employer_fein")
-    if fein and fein.lower() not in ("not found", "null", "none", ""):
+    if not _is_empty(fein):
+        assert fein is not None
         if not FEIN_RE.match(fein.strip()):
-            vr.add("employer_fein", "error",
-                   f"FEIN '{fein}' does not match required format XX-XXXXXXX "
-                   "(2 digits, hyphen, 7 digits)",
-                   fein,
-                   "Verify FEIN from W-2 or IRS correspondence",
-                   penalty=0.2)
+            vr.add(
+                "employer_fein", "error",
+                f"FEIN '{fein}' does not match required format XX-XXXXXXX",
+                fein,
+                "Verify FEIN from W-2 or IRS documentation",
+                penalty=0.2,
+            )
 
-    # ── 11. DUPLICATE FIELD DETECTION ────────────────────
-    # Petitioner name vs employer name — should match
+    # ── 11. PETITIONER NAME MUST MATCH EMPLOYER NAME ─────────────────────────
     pet = (fields.get("petitioner_name") or "").strip().lower()
     emp = (fields.get("employer_name") or "").strip().lower()
     if pet and emp and pet != emp:
-        vr.add("petitioner_name", "warning",
-               f"Petitioner name '{fields.get('petitioner_name')}' does not match "
-               f"employer name '{fields.get('employer_name')}' — should be identical on I-129",
-               str(fields.get("petitioner_name")),
-               "Verify both fields refer to the same entity",
-               penalty=0.1)
+        vr.add(
+            "petitioner_name", "warning",
+            f"Petitioner name '{fields.get('petitioner_name')}' differs from"
+            f" employer name '{fields.get('employer_name')}' — should match on I-129",
+            str(fields.get("petitioner_name")),
+            "Verify both fields refer to the same entity",
+            penalty=0.1,
+        )
 
-    # ── 12. NAME FIELD CONSISTENCY ───────────────────────
+    # ── 12. GIVEN / FAMILY NAME SWAP DETECTION ───────────────────────────────
     full = (fields.get("applicant_name") or "").strip()
     family = (fields.get("applicant_family_name") or "").strip()
     given = (fields.get("applicant_given_name") or "").strip()
-    if full and family and given:
+    if full and family and given and family.lower() != given.lower():
         full_parts = [p.lower() for p in full.split()]
-        # If given name appears first in the full name but is stored as family name
-        # e.g. full="James Robert", family="James", given="Robert" — names are swapped
-        # On USCIS forms, family name always comes LAST in Western names
-        # Check: if the "family" name is the FIRST word of full name and "given" is the LAST word
-        # that is a classic first/last swap
-        family_lower = family.lower()
-        given_lower = given.lower()
-        if (full_parts and
-            full_parts[0] == family_lower and
-            full_parts[-1] == given_lower and
-            family_lower != given_lower):
-            vr.add("applicant_family_name", "warning",
-                   f"Family name '{family}' appears to be the first name, not last name. "
-                   f"On USCIS forms, family name = surname (last name). "
-                   f"'{given}' may be the correct family name.",
-                   family,
-                   "Verify: on I-129 'Family Name' means SURNAME (last name), not first name",
-                   penalty=0.15)
+        # Classic USCIS mistake: family name is the FIRST word on the form
+        # but should be the surname (last name).
+        # Flag if stored 'family' == first word and stored 'given' == last word.
+        if full_parts and full_parts[0] == family.lower() and full_parts[-1] == given.lower():
+            vr.add(
+                "applicant_family_name", "warning",
+                f"Family name '{family}' appears to be the first (given) name."
+                " On USCIS forms 'Family Name' means SURNAME (last name).",
+                family,
+                "Verify: 'Family Name' = surname. Check if given/family fields are swapped.",
+                penalty=0.15,
+            )
 
     return vr
 
 
-# ── Helpers ───────────────────────────────────────────────
+# ── Private helpers ───────────────────────────────────────────────────────────
 
 def _parse_date(val: str) -> tuple[Optional[date], Optional[str]]:
-    """Try multiple date formats. Return (date, None) or (None, error_msg)."""
+    """Try common date formats. Returns (date, None) on success or (None, msg) on failure."""
     val = val.strip()
-    formats = [
-        "%m/%d/%Y",   # 06/20/2023
-        "%d/%m/%Y",   # 20/06/2023
-        "%Y-%m-%d",   # 2023-06-20
-        "%d %b %Y",   # 20 Jun 2023
-        "%d %B %Y",   # 20 June 2023
-        "%B %d, %Y",  # June 20, 2023
-        "%b %d, %Y",  # Jun 20, 2023
-        "%m-%d-%Y",   # 06-20-2023
-        "%d-%m-%Y",   # 20-06-2023
-    ]
-    for fmt in formats:
+    for fmt in (
+        "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d",
+        "%d %b %Y", "%d %B %Y", "%B %d, %Y", "%b %d, %Y",
+        "%m-%d-%Y", "%d-%m-%Y",
+    ):
         try:
             return datetime.strptime(val, fmt).date(), None
         except ValueError:
@@ -303,9 +345,11 @@ def _parse_date(val: str) -> tuple[Optional[date], Optional[str]]:
 
 
 def _parse_wage(val: str) -> Optional[float]:
-    """Extract numeric wage from string like '$80,000', '80000', '80,000/year'."""
-    cleaned = re.sub(r'[^\d.]', '', val.split('/')[0].split('per')[0])
+    """Extract numeric value from strings like '$80,000', '80000/year', '80,000 per annum'."""
+    # Take only the part before any slash or 'per'
+    trimmed = val.split("/")[0].split("per")[0].split("Per")[0]
+    cleaned = re.sub(r"[^\d.]", "", trimmed)
     try:
-        return float(cleaned)
-    except (ValueError, TypeError):
+        return float(cleaned) if cleaned else None
+    except ValueError:
         return None

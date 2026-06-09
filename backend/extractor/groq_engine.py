@@ -1,16 +1,29 @@
 from __future__ import annotations
-import json, logging, time
-from dataclasses import dataclass, field
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
-from groq import Groq, APIError, APITimeoutError, RateLimitError
+
+from groq import APIError
+from groq import APITimeoutError
+from groq import Groq
+from groq import RateLimitError
+
 from config import get_settings
-from extractor.validator import validate_extraction, ValidationResult
+from extractor.validator import ValidationResult
+from extractor.validator import validate_extraction
 
 logger = logging.getLogger("docverify.extractor")
 settings = get_settings()
 
-SYSTEM_PROMPT = """You are a precision immigration document extraction engine used by a top UK-US immigration law firm.
-Extract all fields. Return ONLY valid JSON — no markdown fences, no explanation whatsoever."""
+SYSTEM_PROMPT = (
+    "You are a precision immigration document extraction engine used by a top "
+    "UK-US immigration law firm. Extract all fields. Return ONLY valid JSON — "
+    "no markdown fences, no explanation whatsoever."
+)
 
 EXTRACTION_PROMPT = """Extract every available field from the immigration document below.
 
@@ -61,7 +74,6 @@ class FieldResult:
     confidence: float
     page_hint: str = ""
     needs_review: bool = False
-    # Validation additions
     validation_flags: list = field(default_factory=list)
     validation_severity: str = ""   # "error" | "warning" | ""
 
@@ -83,7 +95,7 @@ class ExtractionResult:
 
     @property
     def hitl_required(self) -> bool:
-        # HITL if confidence below threshold OR any validation errors found
+        """Route to HITL if confidence is low OR validation found hard errors."""
         return (
             self.overall_confidence < (settings.confidence_hitl_threshold / 100)
             or self.validation.has_errors
@@ -95,35 +107,32 @@ class ExtractionResult:
 
     @property
     def validation_error_count(self) -> int:
-        return len([f for f in self.validation.flags if f.severity == "error"])
+        return sum(1 for f in self.validation.flags if f.severity == "error")
 
     @property
     def validation_warning_count(self) -> int:
-        return len([f for f in self.validation.flags if f.severity == "warning"])
+        return sum(1 for f in self.validation.flags if f.severity == "warning")
 
 
 def extract_document(text: str) -> ExtractionResult:
+    """Run extraction with automatic fallback, then validate."""
     start = time.perf_counter()
     result = _call_groq(text, settings.groq_primary_model)
-    if result.success:
-        result = _run_validation(result)
-        result.latency_ms = int((time.perf_counter() - start) * 1000)
-        return result
-    logger.warning("Primary model failed (%s), using fallback", result.error)
-    result = _call_groq(text, settings.groq_fallback_model)
-    result.used_fallback = True
+    if not result.success:
+        logger.warning("Primary model failed (%s), using fallback", result.error)
+        result = _call_groq(text, settings.groq_fallback_model)
+        result.used_fallback = True
     result = _run_validation(result)
     result.latency_ms = int((time.perf_counter() - start) * 1000)
     return result
 
 
 def _run_validation(result: ExtractionResult) -> ExtractionResult:
-    """Run the validation layer against all extracted fields."""
+    """Run the 12-rule validation layer and update field confidence scores."""
     if not result.success:
         return result
 
-    # Build flat dict of field_name → field_value for validator
-    field_dict = {
+    field_dict: dict[str, Any] = {
         f.field_name: f.field_value
         for f in result.fields
         if f.field_value not in (None, "null", "None", "")
@@ -132,38 +141,38 @@ def _run_validation(result: ExtractionResult) -> ExtractionResult:
     vr = validate_extraction(field_dict)
     result.validation = vr
 
-    # Map validation flags back to individual fields
     flagged_by_field: dict[str, list] = {}
     for flag in vr.flags:
         flagged_by_field.setdefault(flag.field_name, []).append(flag)
 
     for f in result.fields:
         flags = flagged_by_field.get(f.field_name, [])
-        if flags:
-            f.validation_flags = flags
-            # Determine worst severity
-            severities = [fl.severity for fl in flags]
-            f.validation_severity = "error" if "error" in severities else "warning"
-            # Errors force needs_review = True and reduce confidence
-            if f.validation_severity == "error":
-                f.needs_review = True
-                f.confidence = min(f.confidence, 0.40)  # errors cap at 40%
-            elif f.validation_severity == "warning":
-                f.needs_review = True
-                f.confidence = min(f.confidence, 0.72)  # warnings cap at 72%
+        if not flags:
+            continue
+        f.validation_flags = flags
+        severities = [fl.severity for fl in flags]
+        f.validation_severity = "error" if "error" in severities else "warning"
+        if f.validation_severity == "error":
+            f.needs_review = True
+            f.confidence = min(f.confidence, 0.40)
+        else:
+            f.needs_review = True
+            f.confidence = min(f.confidence, 0.72)
 
-    # Recalculate overall confidence after validation penalties
-    if result.fields:
-        valid_confs = [f.confidence for f in result.fields if f.field_value not in (None, "null")]
-        if valid_confs:
-            raw_avg = sum(valid_confs) / len(valid_confs)
-            penalised = raw_avg - vr.overall_penalty
-            result.overall_confidence = max(0.0, min(1.0, penalised))
+    # Recalculate overall confidence including validation penalty
+    valid_confs = [
+        f.confidence for f in result.fields
+        if f.field_value not in (None, "null", "None", "")
+    ]
+    if valid_confs:
+        penalised = (sum(valid_confs) / len(valid_confs)) - vr.overall_penalty
+        result.overall_confidence = max(0.0, min(1.0, penalised))
 
     if vr.has_errors:
         logger.warning(
-            "Validation found %d error(s) and %d warning(s) — document routed to HITL",
-            result.validation_error_count, result.validation_warning_count
+            "Validation: %d error(s), %d warning(s) — routing to HITL",
+            result.validation_error_count,
+            result.validation_warning_count,
         )
 
     return result
@@ -176,7 +185,7 @@ def _call_groq(text: str, model: str) -> ExtractionResult:
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": EXTRACTION_PROMPT + text}
+                {"role": "user", "content": EXTRACTION_PROMPT + text},
             ],
             temperature=0.0,
             max_tokens=4096,
@@ -187,25 +196,30 @@ def _call_groq(text: str, model: str) -> ExtractionResult:
             parts = raw.split("```")
             raw = parts[1][4:] if parts[1].startswith("json") else parts[1]
         return _parse_response(raw.strip(), model)
-    except APITimeoutError as e:
-        return ExtractionResult(success=False, error=f"timeout:{e}", model_used=model)
-    except RateLimitError as e:
-        return ExtractionResult(success=False, error=f"rate_limit:{e}", model_used=model)
-    except APIError as e:
-        return ExtractionResult(success=False, error=f"api:{e}", model_used=model)
-    except Exception as e:
-        return ExtractionResult(success=False, error=str(e), model_used=model)
+    except APITimeoutError as exc:
+        return ExtractionResult(success=False, error=f"timeout:{exc}", model_used=model)
+    except RateLimitError as exc:
+        return ExtractionResult(success=False, error=f"rate_limit:{exc}", model_used=model)
+    except APIError as exc:
+        return ExtractionResult(success=False, error=f"api:{exc}", model_used=model)
+    except Exception as exc:  # noqa: BLE001
+        return ExtractionResult(success=False, error=str(exc), model_used=model)
 
 
 def _parse_response(raw: str, model: str) -> ExtractionResult:
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.error("JSON parse error: %s | raw[:300]=%s", e, raw[:300])
-        return ExtractionResult(success=False, error=f"json:{e}", model_used=model, raw_json=raw)
+    except json.JSONDecodeError as exc:
+        logger.error("JSON parse error: %s | raw[:300]=%s", exc, raw[:300])
+        return ExtractionResult(
+            success=False, error=f"json:{exc}", model_used=model, raw_json=raw
+        )
 
-    def to_01(v):
-        v = float(v or 0)
+    def to_01(v: Any) -> float:
+        try:
+            v = float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
         return max(0.0, min(1.0, v / 100.0 if v > 1 else v))
 
     fields = [
@@ -214,7 +228,10 @@ def _parse_response(raw: str, model: str) -> ExtractionResult:
             field_value=f.get("field_value"),
             confidence=to_01(f.get("confidence", 0)),
             page_hint=str(f.get("page_hint", "")),
-            needs_review=bool(f.get("needs_review", False)) or to_01(f.get("confidence", 0)) < 0.75,
+            needs_review=(
+                bool(f.get("needs_review", False))
+                or to_01(f.get("confidence", 0)) < 0.75
+            ),
         )
         for f in data.get("fields", [])
     ]
