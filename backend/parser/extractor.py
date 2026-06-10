@@ -38,13 +38,13 @@ def extract_text_chunked(pdf_path: str) -> tuple[list[str], int]:
     try:
         full_text, page_count = _extract_raw(pdf_path)
         chunks = []
-        
+
         if not full_text:
             return chunks, page_count
 
         start = 0
         text_length = len(full_text)
-        
+
         while start < text_length:
             end = min(start + CHUNK_SIZE, text_length)
             chunks.append(full_text[start:end])
@@ -52,7 +52,7 @@ def extract_text_chunked(pdf_path: str) -> tuple[list[str], int]:
                 break
             # Step back by OVERLAP for the next chunk
             start = end - OVERLAP
-            
+
         return chunks, page_count
     except Exception as exc:
         logger.error("Failed chunked extraction: %s", str(exc))
@@ -63,7 +63,7 @@ def _extract_raw(pdf_path: str) -> tuple[str, int]:
     """Helper to handle the pdfplumber -> PyMuPDF fallback logic safely."""
     text = ""
     page_count = 0
-    
+
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page_count = len(pdf.pages)
@@ -71,7 +71,7 @@ def _extract_raw(pdf_path: str) -> tuple[str, int]:
             text = "\n".join(pages_text)
     except Exception as e:
         logger.warning("pdfplumber failed: %s", str(e))
-        
+
     if len(text.strip()) < 100:
         logger.info("Falling back to PyMuPDF...")
         try:
@@ -80,7 +80,7 @@ def _extract_raw(pdf_path: str) -> tuple[str, int]:
                 text = "\n".join([page.get_text() for page in doc])
         except Exception as e:
             logger.error("PyMuPDF fallback failed: %s", str(e))
-    
+
     # Critical: force garbage collection due to Render 512MB RAM constraints
     gc.collect()
     return text, page_count

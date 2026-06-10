@@ -90,7 +90,7 @@ def extract_fields_chunked(chunks: list[str], document_type: str) -> dict[str, A
 
     for i, chunk in enumerate(chunks):
         logger.info("Processing chunk %d/%d for type %s", i + 1, len(chunks), document_type)
-        
+
         chunk_prompt = f"""You are extracting fields from a section of an immigration document.
 Document type: {document_type}
 Fields to extract:
@@ -108,12 +108,12 @@ Document section:
         if not raw_resp:
             logger.warning("Chunk %d failed to return data", i + 1)
             continue
-            
+
         try:
             chunk_data = json.loads(raw_resp)
             for field_def in schema:
                 fname = field_def["field_name"]
-                
+
                 # If field isn't tracked yet, or the current tracked value is a hallucinated empty string,
                 # we are eligible to overwrite it.
                 if fname not in merged_results or _is_null_value(merged_results.get(fname)):
@@ -121,7 +121,7 @@ Document section:
                     # Only overwrite if the new chunk actually found something real
                     if not _is_null_value(val):
                         merged_results[fname] = val
-                        
+
         except json.JSONDecodeError as exc:
             logger.error("JSON decode error on chunk %d: %s", i + 1, exc)
 
@@ -132,7 +132,7 @@ def _execute_groq_call(prompt: str) -> tuple[str, bool]:
     """Handles the raw Groq request with exponential backoff fallback logic."""
     model = settings.groq_primary_model
     used_fallback = False
-    
+
     try:
         raw = _make_api_call(prompt, model)
     except Exception as exc:

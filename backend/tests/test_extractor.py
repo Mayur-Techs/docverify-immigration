@@ -41,11 +41,11 @@ MOCK_CHUNK_2 = {
 def test_extract_text_legacy_truncation() -> None:
     """Verify legacy extraction caps output at MAX_CHARS to preserve memory bounds."""
     import parser.extractor as ext
-    
+
     dummy_text = "B" * 15000
     original_raw = ext._extract_raw
     ext._extract_raw = lambda path: (dummy_text, 2)
-    
+
     try:
         result = extract_text("dummy.pdf")
         assert result.success
@@ -63,7 +63,7 @@ def test_extract_text_chunked_overlap() -> None:
     dummy_text = "A" * 25000
     original_raw = ext._extract_raw
     ext._extract_raw = lambda path: (dummy_text, 5)
-    
+
     try:
         chunks, pages = extract_text_chunked("dummy.pdf")
         assert len(chunks) == 2
@@ -95,9 +95,9 @@ def test_extract_fields_chunked_merges_data(mocker: Any) -> None:
         "extractor.groq_engine._execute_groq_call",
         side_effect=[(r, False) for r in mock_responses],
     )
-    
+
     result = extract_fields_chunked(["chunk1", "chunk2"], "i129")
-    
+
     assert result.get("petitioner_name") == "Acme Systems Corp"
     assert result.get("petitioner_fein") == "12-3456789"
     assert result.get("job_title") == "Lead Software Engineer"
@@ -110,9 +110,9 @@ def test_execute_groq_call_fallback(mocker: Any) -> None:
         "extractor.groq_engine._make_api_call",
         side_effect=[APITimeoutError("Primary model timed out"), '{"extracted": "data"}'],
     )
-    
+
     raw_resp, used_fallback = _execute_groq_call("Extract something")
-    
+
     assert used_fallback is True
     assert raw_resp == '{"extracted": "data"}'
 

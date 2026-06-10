@@ -106,7 +106,7 @@ def _is_valid_status_enum(value: str) -> bool:
     if not value:
         return False
     valid = {
-        "d/s", "d/s.", "ds", "duration of status", 
+        "d/s", "d/s.", "ds", "duration of status",
         "proc", "processing", "n/a", "na", "indefinite"
     }
     return str(value).strip().lower() in valid
@@ -131,22 +131,22 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
         "status_expiry",
     ]
     parsed_dates: dict[str, Optional[date]] = {}
-    
+
     for fname in date_field_names:
         val = fields.get(fname)
         if _is_empty(val):
             continue
-            
+
         # Narrow the type strictly to str (fixes the Optional[str] mypy issue without suppression)
         assert val is not None
-            
+
         # Skip date parsing entirely for valid enum strings
         if _is_valid_status_enum(val):
             continue
-            
+
         parsed, _ = _parse_date(val)
         parsed_dates[fname] = parsed
-        
+
         if parsed is None:
             vr.add(
                 fname, "error",

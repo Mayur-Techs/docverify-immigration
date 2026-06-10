@@ -60,11 +60,28 @@ async def _process(doc_id: int) -> None:
         merged_dict = extract_fields_chunked(chunks, detected_type)
 
         # Wrap merged dict into ExtractionResult for the validation layer
-        fields_list = [
-            FieldResult(field_name=k, field_value=v, confidence=0.95)
-            for k, v in merged_dict.items()
-            if not _is_null_merged(v)
-        ]
+        schema = get_schema_for_type(detected_type)
+        schema_field_names = [f["field_name"] for f in schema]
+
+        fields_list = []
+        for fname in schema_field_names:
+            val = merged_dict.get(fname)
+            if _is_null_merged(val):
+                fields_list.append(FieldResult(
+                    field_name=fname,
+                    field_value=None,
+                    confidence=0.0,
+                    needs_review=True,
+                    validation_severity="warning",
+                ))
+            else:
+                fields_list.append(FieldResult(
+                    field_name=fname,
+                    field_value=val,
+                    confidence=0.95,
+                ))
+
+
         result = ExtractionResult(
             success=True,
             document_type=detected_type,
