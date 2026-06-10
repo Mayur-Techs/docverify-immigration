@@ -17,6 +17,7 @@ from extractor.groq_engine import FieldResult
 from extractor.groq_engine import _run_validation
 from extractor.groq_engine import extract_fields_chunked
 from parser.extractor import extract_text_chunked
+from extractor.field_schemas import get_schema_for_type
 
 logger = logging.getLogger("docverify.pipeline")
 settings = get_settings()
