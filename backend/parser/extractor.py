@@ -9,7 +9,8 @@ import pdfplumber
 
 logger = logging.getLogger("docverify.parser")
 MAX_CHARS = 8000
-OVERLAP = 200
+CHUNK_SIZE = 20_000
+OVERLAP = 500
 
 @dataclass
 class ParseResult:
@@ -45,7 +46,7 @@ def extract_text_chunked(pdf_path: str) -> tuple[list[str], int]:
         text_length = len(full_text)
         
         while start < text_length:
-            end = min(start + MAX_CHARS, text_length)
+            end = min(start + CHUNK_SIZE, text_length)
             chunks.append(full_text[start:end])
             if end == text_length:
                 break

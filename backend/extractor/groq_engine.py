@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
-from groq import APIError
-from groq import APITimeoutError
 from groq import Groq
-from groq import RateLimitError
 
 from config import get_settings
 from extractor.field_schemas import get_schema_for_type

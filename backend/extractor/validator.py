@@ -312,7 +312,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     if pet and emp and pet != emp:
         vr.add(
             "petitioner_name", "warning",
-            f"Petitioner name differs from employer name",
+            "Petitioner name differs from employer name",
             str(fields.get("petitioner_name")),
             "Verify both fields refer to the same entity",
             penalty=0.1,

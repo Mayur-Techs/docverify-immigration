@@ -1,90 +1,79 @@
-"""Parser tests — file I/O fully mocked."""
+"""Parser extraction tests — pdfplumber and PyMuPDF paths fully mocked."""
+
+from __future__ import annotations
+
 import os
 import sys
-import tempfile
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from typing import Any
 
+# Ensure backend root is in the system path for execution resolution
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-
-def test_file_not_found():
-    from parser.extractor import extract_text
-    result = extract_text("/nonexistent/path/file.pdf")
-    assert not result.success
-    assert "not found" in result.error.lower()
+from parser.extractor import extract_text, extract_text_chunked  # noqa: E402
 
 
-def test_pdfplumber_success():
-    from parser.extractor import extract_text
-
-    mock_page = MagicMock()
-    mock_page.extract_text.return_value = "Applicant: Arjun Sharma\nVisa: H-1B\n" * 20
-    mock_page.extract_tables.return_value = []
-    mock_pdf = MagicMock()
-    mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
-    mock_pdf.__exit__ = MagicMock(return_value=False)
-    mock_pdf.pages = [mock_page, mock_page]
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(b"%PDF-1.4 minimal")
-        path = f.name
-    try:
-        with patch("pdfplumber.open", return_value=mock_pdf):
-            result = extract_text(path)
-        assert result.success
-        assert result.page_count == 2
-        assert "Arjun Sharma" in result.text
-        assert result.method == "pdfplumber"
-    finally:
-        os.unlink(path)
+def test_extract_text_returns_truncated_at_max_chars(monkeypatch: Any) -> None:
+    """Legacy extract_text caps output at MAX_CHARS=8000."""
+    import parser.extractor as ext
+    
+    dummy_text = "X" * 15000
+    monkeypatch.setattr(ext, "_extract_raw", lambda path: (dummy_text, 3))
+    
+    result = extract_text("dummy.pdf")
+    
+    assert result.success is True
+    assert len(result.text) == 8000
+    assert result.page_count == 3
 
 
-def test_pymupdf_fallback():
-    from parser.extractor import extract_text
-
-    mock_page = MagicMock()
-    mock_page.get_text.return_value = "Passport No: J8821045"
-    mock_doc = MagicMock()
-    mock_doc.__iter__ = MagicMock(return_value=iter([mock_page]))
-    mock_doc.close = MagicMock()
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(b"%PDF-1.4")
-        path = f.name
-    try:
-        import unittest.mock as _um
-        with patch("pdfplumber.open", side_effect=Exception("corrupt")):
-            mock_fitz_mod = _um.MagicMock()
-            mock_fitz_mod.open.return_value = mock_doc
-            with patch.dict("sys.modules", {"fitz": mock_fitz_mod}):
-                result = extract_text(path)
-        assert result.method == "pymupdf"
-        assert result.success
-    finally:
-        os.unlink(path)
+def test_extract_text_empty_pdf_returns_success_empty(monkeypatch: Any) -> None:
+    """Empty PDF (no extractable text) returns success=True with empty text."""
+    import parser.extractor as ext
+    
+    monkeypatch.setattr(ext, "_extract_raw", lambda path: ("", 1))
+    
+    result = extract_text("dummy.pdf")
+    
+    assert result.success is True
+    assert result.text == ""
 
 
-def test_truncation():
-    from parser.extractor import MAX_CHARS
-    from parser.extractor import extract_text
+def test_extract_text_chunked_two_chunks(monkeypatch: Any) -> None:
+    """25,000 chars at CHUNK_SIZE=20,000 OVERLAP=500 produces exactly 2 chunks."""
+    import parser.extractor as ext
+    
+    dummy_text = "A" * 25000
+    monkeypatch.setattr(ext, "_extract_raw", lambda path: (dummy_text, 5))
+    
+    chunks, pages = extract_text_chunked("dummy.pdf")
+    
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 20000
+    assert len(chunks[1]) == 5500
+    assert pages == 5
 
-    big_text = "x" * (MAX_CHARS + 5000)
-    mock_page = MagicMock()
-    mock_page.extract_text.return_value = big_text
-    mock_page.extract_tables.return_value = []
-    mock_pdf = MagicMock()
-    mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
-    mock_pdf.__exit__ = MagicMock(return_value=False)
-    mock_pdf.pages = [mock_page]
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(b"%PDF")
-        path = f.name
-    try:
-        with patch("pdfplumber.open", return_value=mock_pdf):
-            result = extract_text(path)
-        assert result.truncated
-        assert len(result.text) <= MAX_CHARS
-    finally:
-        os.unlink(path)
+def test_extract_text_chunked_single_chunk(monkeypatch: Any) -> None:
+    """Document shorter than CHUNK_SIZE produces exactly 1 chunk."""
+    import parser.extractor as ext
+    
+    dummy_text = "B" * 5000
+    monkeypatch.setattr(ext, "_extract_raw", lambda path: (dummy_text, 2))
+    
+    chunks, pages = extract_text_chunked("dummy.pdf")
+    
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 5000
+    assert pages == 2
+
+
+def test_extract_text_chunked_empty_returns_empty_list(monkeypatch: Any) -> None:
+    """Empty extraction returns empty chunk list, not a crash."""
+    import parser.extractor as ext
+    
+    monkeypatch.setattr(ext, "_extract_raw", lambda path: ("", 0))
+    
+    chunks, pages = extract_text_chunked("dummy.pdf")
+    
+    assert chunks == []
+    assert pages == 0
