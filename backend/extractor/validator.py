@@ -106,7 +106,7 @@ def _is_valid_status_enum(value: str) -> bool:
     if not value:
         return False
     valid = {
-        "d/s", "d/s.", "ds", "duration of status",
+        "d/s", "d/s.", "ds", "duration of status","D/S", "D/S.", "DS",
         "proc", "processing", "n/a", "na", "indefinite"
     }
     return str(value).strip().lower() in valid
