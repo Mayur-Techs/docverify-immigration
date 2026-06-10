@@ -13,6 +13,7 @@ from groq import Groq
 from groq import RateLimitError
 
 from config import get_settings
+from extractor.field_schemas import get_schema_for_type
 from extractor.validator import ValidationResult
 from extractor.validator import validate_extraction
 
@@ -21,51 +22,9 @@ settings = get_settings()
 
 SYSTEM_PROMPT = (
     "You are a precision immigration document extraction engine used by a top "
-    "UK-US immigration law firm. Extract all fields. Return ONLY valid JSON — "
+    "UK-US immigration law firm. Extract all fields requested. Return ONLY valid JSON — "
     "no markdown fences, no explanation whatsoever."
 )
-
-EXTRACTION_PROMPT = """Extract every available field from the immigration document below.
-
-Return ONLY this JSON structure, nothing else:
-{
-  "document_type": "<i129|i140|i485|passport|visa|l1_petition|ds160|eea_form|biometric|other>",
-  "document_type_confidence": <0-100>,
-  "overall_confidence": <0-100>,
-  "extraction_notes": "<warnings or issues>",
-  "fields": [
-    {
-      "field_name": "<snake_case>",
-      "field_value": "<value or null>",
-      "confidence": <0-100>,
-      "page_hint": "<section or page>",
-      "needs_review": <true|false>
-    }
-  ]
-}
-
-Confidence scoring:
-- 95-100: Clearly visible, unambiguous
-- 85-94: Visible, minor format ambiguity
-- 70-84: Inferred or partially visible
-- 50-69: Significant uncertainty
-- 0-49: Very uncertain — set needs_review: true
-
-Set needs_review: true when confidence < 75 OR value looks malformed/incomplete.
-
-Key fields to extract (all that exist):
-applicant_name, applicant_family_name, applicant_given_name, date_of_birth,
-nationality, country_of_citizenship, country_of_birth, passport_number,
-passport_issue_date, passport_expiry_date, alien_registration_number,
-petition_number, receipt_number, employer_name, petitioner_name, employer_fein,
-visa_classification, priority_date, validity_period_start, validity_period_end,
-consulate_or_port_of_entry, job_title, position_offered, annual_wage, salary,
-lca_case_number, current_immigration_status, status_expiry_date, form_number,
-beneficiary_address, petitioner_address, relationship_type, mrz_line_1, mrz_line_2
-
-DOCUMENT TEXT:
-"""
-
 
 @dataclass
 class FieldResult:
@@ -75,7 +34,7 @@ class FieldResult:
     page_hint: str = ""
     needs_review: bool = False
     validation_flags: list = field(default_factory=list)
-    validation_severity: str = ""   # "error" | "warning" | ""
+    validation_severity: str = ""
 
 
 @dataclass
@@ -95,7 +54,6 @@ class ExtractionResult:
 
     @property
     def hitl_required(self) -> bool:
-        """Route to HITL if confidence is low OR validation found hard errors."""
         return (
             self.overall_confidence < (settings.confidence_hitl_threshold / 100)
             or self.validation.has_errors
@@ -114,21 +72,111 @@ class ExtractionResult:
         return sum(1 for f in self.validation.flags if f.severity == "warning")
 
 
-def extract_document(text: str) -> ExtractionResult:
-    """Run extraction with automatic fallback, then validate."""
-    start = time.perf_counter()
-    result = _call_groq(text, settings.groq_primary_model)
-    if not result.success:
-        logger.warning("Primary model failed (%s), using fallback", result.error)
-        result = _call_groq(text, settings.groq_fallback_model)
-        result.used_fallback = True
-    result = _run_validation(result)
-    result.latency_ms = int((time.perf_counter() - start) * 1000)
-    return result
+def _is_null_value(v: Any) -> bool:
+    """Defensive check against LLM hallucinated null-equivalents with inconsistent casing."""
+    if v is None:
+        return True
+    return str(v).strip().lower() in {"null", "none", "", "not found", "n/a", "na", "unknown"}
+
+
+def extract_fields_chunked(chunks: list[str], document_type: str) -> dict[str, Any]:
+    """
+    Processes chunks sequentially using targeted field schemas. 
+    First non-null value wins.
+    """
+    schema = get_schema_for_type(document_type)
+    schema_json = json.dumps(
+        [{"field_name": f["field_name"], "description": f["description"]} for f in schema],
+        indent=2
+    )
+
+    merged_results: dict[str, Any] = {}
+
+    for i, chunk in enumerate(chunks):
+        logger.info("Processing chunk %d/%d for type %s", i + 1, len(chunks), document_type)
+        
+        chunk_prompt = f"""You are extracting fields from a section of an immigration document.
+Document type: {document_type}
+Fields to extract:
+{schema_json}
+
+Return ONLY a valid JSON object. No explanation, no markdown, no code fences.
+For each field, return the extracted value as a string, or null if not found in this section.
+Dates must be in MM/DD/YYYY format. Currency as numeric string only e.g. "95000".
+"D/S" and "Duration of Status" are valid values for status expiry fields — return them as-is, do not convert.
+
+Document section:
+{chunk}"""
+
+        raw_resp, used_fallback = _execute_groq_call(chunk_prompt)
+        if not raw_resp:
+            logger.warning("Chunk %d failed to return data", i + 1)
+            continue
+            
+        try:
+            chunk_data = json.loads(raw_resp)
+            for field_def in schema:
+                fname = field_def["field_name"]
+                
+                # If field isn't tracked yet, or the current tracked value is a hallucinated empty string,
+                # we are eligible to overwrite it.
+                if fname not in merged_results or _is_null_value(merged_results.get(fname)):
+                    val = chunk_data.get(fname)
+                    # Only overwrite if the new chunk actually found something real
+                    if not _is_null_value(val):
+                        merged_results[fname] = val
+                        
+        except json.JSONDecodeError as exc:
+            logger.error("JSON decode error on chunk %d: %s", i + 1, exc)
+
+    return merged_results
+
+
+def _execute_groq_call(prompt: str) -> tuple[str, bool]:
+    """Handles the raw Groq request with exponential backoff fallback logic."""
+    model = settings.groq_primary_model
+    used_fallback = False
+    
+    try:
+        raw = _make_api_call(prompt, model)
+    except Exception as exc:
+        logger.warning("Primary model failed (%s), using fallback", str(exc))
+        model = settings.groq_fallback_model
+        used_fallback = True
+        try:
+            raw = _make_api_call(prompt, model)
+        except Exception as fallback_exc:
+            logger.error("Fallback model also failed: %s", str(fallback_exc))
+            return "", used_fallback
+
+    # Clean markdown fences strictly
+    raw = raw.strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        if len(parts) >= 3:
+            raw = parts[1]
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+    return raw, used_fallback
+
+
+def _make_api_call(prompt: str, model: str) -> str:
+    client = Groq(api_key=settings.groq_api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=4096,
+        timeout=settings.groq_timeout,
+    )
+    return resp.choices[0].message.content
 
 
 def _run_validation(result: ExtractionResult) -> ExtractionResult:
-    """Run the 12-rule validation layer and update field confidence scores."""
+    """Run the validation layer and apply penalties."""
     if not result.success:
         return result
 
@@ -159,7 +207,6 @@ def _run_validation(result: ExtractionResult) -> ExtractionResult:
             f.needs_review = True
             f.confidence = min(f.confidence, 0.72)
 
-    # Recalculate overall confidence including validation penalty
     valid_confs = [
         f.confidence for f in result.fields
         if f.field_value not in (None, "null", "None", "")
@@ -168,80 +215,4 @@ def _run_validation(result: ExtractionResult) -> ExtractionResult:
         penalised = (sum(valid_confs) / len(valid_confs)) - vr.overall_penalty
         result.overall_confidence = max(0.0, min(1.0, penalised))
 
-    if vr.has_errors:
-        logger.warning(
-            "Validation: %d error(s), %d warning(s) — routing to HITL",
-            result.validation_error_count,
-            result.validation_warning_count,
-        )
-
     return result
-
-
-def _call_groq(text: str, model: str) -> ExtractionResult:
-    try:
-        client = Groq(api_key=settings.groq_api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": EXTRACTION_PROMPT + text},
-            ],
-            temperature=0.0,
-            max_tokens=4096,
-            timeout=settings.groq_timeout,
-        )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1][4:] if parts[1].startswith("json") else parts[1]
-        return _parse_response(raw.strip(), model)
-    except APITimeoutError as exc:
-        return ExtractionResult(success=False, error=f"timeout:{exc}", model_used=model)
-    except RateLimitError as exc:
-        return ExtractionResult(success=False, error=f"rate_limit:{exc}", model_used=model)
-    except APIError as exc:
-        return ExtractionResult(success=False, error=f"api:{exc}", model_used=model)
-    except Exception as exc:  # noqa: BLE001
-        return ExtractionResult(success=False, error=str(exc), model_used=model)
-
-
-def _parse_response(raw: str, model: str) -> ExtractionResult:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("JSON parse error: %s | raw[:300]=%s", exc, raw[:300])
-        return ExtractionResult(
-            success=False, error=f"json:{exc}", model_used=model, raw_json=raw
-        )
-
-    def to_01(v: Any) -> float:
-        try:
-            v = float(v or 0)
-        except (TypeError, ValueError):
-            return 0.0
-        return max(0.0, min(1.0, v / 100.0 if v > 1 else v))
-
-    fields = [
-        FieldResult(
-            field_name=f.get("field_name", "unknown"),
-            field_value=f.get("field_value"),
-            confidence=to_01(f.get("confidence", 0)),
-            page_hint=str(f.get("page_hint", "")),
-            needs_review=(
-                bool(f.get("needs_review", False))
-                or to_01(f.get("confidence", 0)) < 0.75
-            ),
-        )
-        for f in data.get("fields", [])
-    ]
-    return ExtractionResult(
-        success=True,
-        document_type=data.get("document_type", "other"),
-        document_type_confidence=to_01(data.get("document_type_confidence", 0)),
-        overall_confidence=to_01(data.get("overall_confidence", 0)),
-        fields=fields,
-        extraction_notes=data.get("extraction_notes", ""),
-        model_used=model,
-        raw_json=raw,
-    )

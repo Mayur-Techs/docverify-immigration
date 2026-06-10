@@ -1,91 +1,85 @@
 from __future__ import annotations
+
 import gc
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+
+import fitz  # PyMuPDF
+import pdfplumber
 
 logger = logging.getLogger("docverify.parser")
-MAX_CHARS = 8_000  # reduced from 12k — saves ~50MB per request
-
+MAX_CHARS = 8000
+OVERLAP = 200
 
 @dataclass
 class ParseResult:
     success: bool
     text: str = ""
-    page_count: int = 0
-    raw_length: int = 0
-    truncated: bool = False
-    method: str = ""
     error: str = ""
+    page_count: int = 0
 
 
-def extract_text(file_path: str) -> ParseResult:
-    path = Path(file_path)
-    if not path.exists():
-        return ParseResult(success=False, error=f"File not found: {file_path}")
-    result = _try_pdfplumber(path)
-    if result.success and len(result.text.strip()) > 100:
-        return result
-    logger.warning("pdfplumber sparse, trying pymupdf: %s", path.name)
-    fallback = _try_pymupdf(path)
-    return fallback if (fallback.success and len(fallback.text) > len(result.text)) else result
-
-
-def _try_pdfplumber(path: Path) -> ParseResult:
+def extract_text(pdf_path: str) -> ParseResult:
+    """Legacy full-text extraction — keeping for backward compatibility."""
     try:
-        import pdfplumber
-        pages_text = []
-        chars_so_far = 0
-        with pdfplumber.open(str(path)) as pdf:
-            count = len(pdf.pages)
-            for page in pdf.pages:
-                if chars_so_far >= MAX_CHARS:
-                    break
-                t = page.extract_text() or ""
-                # Skip table extraction on large docs to save memory
-                if chars_so_far + len(t) < MAX_CHARS - 1000:
-                    for table in (page.extract_tables() or []):
-                        for row in table:
-                            t += "\n" + " | ".join(str(c) for c in row if c)
-                pages_text.append(t)
-                chars_so_far += len(t)
-        full = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
-        raw = len(full)
-        result = ParseResult(
-            success=True, text=full[:MAX_CHARS], page_count=count,
-            raw_length=raw, truncated=raw > MAX_CHARS, method="pdfplumber",
-        )
-        del pages_text, full
-        gc.collect()
-        return result
-    except Exception as e:
-        gc.collect()
-        return ParseResult(success=False, error=str(e), method="pdfplumber")
+        text, page_count = _extract_raw(pdf_path)
+        return ParseResult(success=True, text=text[:MAX_CHARS], page_count=page_count)
+    except Exception as exc:
+        return ParseResult(success=False, error=str(exc))
 
 
-def _try_pymupdf(path: Path) -> ParseResult:
+def extract_text_chunked(pdf_path: str) -> tuple[list[str], int]:
+    """
+    Production-grade parser. Extracts text without OOMing and splits into
+    MAX_CHARS chunks with an OVERLAP to ensure boundary fields are not missed.
+    Returns (chunks, page_count).
+    """
     try:
-        import fitz  # noqa: PLC0415
-        doc = fitz.open(str(path))
-        pages = []
-        chars_so_far = 0
-        for page in doc:
-            if chars_so_far >= MAX_CHARS:
+        full_text, page_count = _extract_raw(pdf_path)
+        chunks = []
+        
+        if not full_text:
+            return chunks, page_count
+
+        start = 0
+        text_length = len(full_text)
+        
+        while start < text_length:
+            end = min(start + MAX_CHARS, text_length)
+            chunks.append(full_text[start:end])
+            if end == text_length:
                 break
-            t = page.get_text("text")
-            pages.append(t)
-            chars_so_far += len(t)
-        doc.close()
-        del doc
-        full = "\n\n--- PAGE BREAK ---\n\n".join(pages)
-        raw = len(full)
-        result = ParseResult(
-            success=True, text=full[:MAX_CHARS], page_count=len(pages),
-            raw_length=raw, truncated=raw > MAX_CHARS, method="pymupdf",
-        )
-        del pages, full
-        gc.collect()
-        return result
+            # Step back by OVERLAP for the next chunk
+            start = end - OVERLAP
+            
+        return chunks, page_count
+    except Exception as exc:
+        logger.error("Failed chunked extraction: %s", str(exc))
+        return [], 0
+
+
+def _extract_raw(pdf_path: str) -> tuple[str, int]:
+    """Helper to handle the pdfplumber -> PyMuPDF fallback logic safely."""
+    text = ""
+    page_count = 0
+    
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page_count = len(pdf.pages)
+            pages_text = [page.extract_text() or "" for page in pdf.pages]
+            text = "\n".join(pages_text)
     except Exception as e:
-        gc.collect()
-        return ParseResult(success=False, error=str(e), method="pymupdf")
+        logger.warning("pdfplumber failed: %s", str(e))
+        
+    if len(text.strip()) < 100:
+        logger.info("Falling back to PyMuPDF...")
+        try:
+            with fitz.open(pdf_path) as doc:
+                page_count = len(doc)
+                text = "\n".join([page.get_text() for page in doc])
+        except Exception as e:
+            logger.error("PyMuPDF fallback failed: %s", str(e))
+    
+    # Critical: force garbage collection due to Render 512MB RAM constraints
+    gc.collect()
+    return text, page_count

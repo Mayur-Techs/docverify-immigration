@@ -40,15 +40,12 @@ FEIN_RE = re.compile(r"^\d{2}-\d{7}$")
 PASSPORT_HAS_SPACE = re.compile(r"\s")
 
 # ── Normalise visa strings like "H1B" → "H-1B", "L1A" → "L-1A" ──────────────
-# Only insert hyphen when a letter group is immediately followed by a digit
-# e.g. H1B → H-1B   but   H-1B stays H-1B   and   F1 → F-1 (checked below)
 VISA_NORMALISE_RE = re.compile(r"^([A-Za-z]+)(\d)")
 
 
 def _normalise_visa(raw: str) -> str:
     """Insert hyphen between leading letters and first digit if missing."""
     cleaned = raw.strip().upper()
-    # Already has a hyphen in the right place — leave it
     if "-" in cleaned:
         return cleaned
     m = VISA_NORMALISE_RE.match(cleaned)
@@ -60,7 +57,7 @@ def _normalise_visa(raw: str) -> str:
 @dataclass
 class ValidationFlag:
     field_name: str
-    severity: str           # "error" | "warning"
+    severity: str
     reason: str
     original_value: str
     suggested_action: str
@@ -69,7 +66,7 @@ class ValidationFlag:
 @dataclass
 class ValidationResult:
     flags: list[ValidationFlag] = field(default_factory=list)
-    overall_penalty: float = 0.0    # subtracted from average confidence
+    overall_penalty: float = 0.0
 
     def add(
         self,
@@ -98,12 +95,21 @@ class ValidationResult:
         return [f.field_name for f in self.flags if f.severity == "error"]
 
 
-# ── Skip sentinel values returned by the LLM ──────────────────────────────────
 _EMPTY = {"not found", "null", "none", "n/a", "unknown", ""}
-
 
 def _is_empty(val: Optional[str]) -> bool:
     return val is None or str(val).strip().lower() in _EMPTY
+
+
+def _is_valid_status_enum(value: str) -> bool:
+    """Defensive check for valid non-date statuses to prevent false D/S errors."""
+    if not value:
+        return False
+    valid = {
+        "d/s", "d/s.", "ds", "duration of status", 
+        "proc", "processing", "n/a", "na", "indefinite"
+    }
+    return str(value).strip().lower() in valid
 
 
 def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
@@ -122,19 +128,30 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
         "validity_period_end",
         "status_expiry_date",
         "priority_date",
+        "status_expiry",
     ]
     parsed_dates: dict[str, Optional[date]] = {}
+    
     for fname in date_field_names:
         val = fields.get(fname)
         if _is_empty(val):
             continue
-        parsed, _ = _parse_date(val)  # type: ignore[arg-type]
+            
+        # Narrow the type strictly to str (fixes the Optional[str] mypy issue without suppression)
+        assert val is not None
+            
+        # Skip date parsing entirely for valid enum strings
+        if _is_valid_status_enum(val):
+            continue
+            
+        parsed, _ = _parse_date(val)
         parsed_dates[fname] = parsed
+        
         if parsed is None:
             vr.add(
                 fname, "error",
-                f"Cannot parse date '{val}' — check for invalid month/day (e.g. month 13)",
-                val,  # type: ignore[arg-type]
+                f"Cannot parse date '{val}' — check for invalid month/day",
+                val,
                 "Manually verify and correct the date",
                 penalty=0.3,
             )
@@ -142,7 +159,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
             vr.add(
                 fname, "error",
                 f"Year {parsed.year} is outside valid range (1900–2100)",
-                val,  # type: ignore[arg-type]
+                val,
                 "Verify the year is correct",
                 penalty=0.3,
             )
@@ -153,7 +170,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     if issue and expiry and expiry <= issue:
         vr.add(
             "passport_expiry_date", "error",
-            f"Passport expiry ({expiry}) is on or before issue date ({issue}) — dates are reversed",
+            f"Passport expiry ({expiry}) is on or before issue date ({issue})",
             str(expiry),
             "Swap issue and expiry dates — they appear reversed",
             penalty=0.4,
@@ -182,7 +199,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
         )
 
     # ── 5. IMMIGRATION STATUS EXPIRED OVER A YEAR AGO ───────────────────────
-    status_exp = parsed_dates.get("status_expiry_date")
+    status_exp = parsed_dates.get("status_expiry_date") or parsed_dates.get("status_expiry")
     if status_exp:
         years_ago = (date.today() - status_exp).days / 365
         if years_ago > 1:
@@ -197,11 +214,11 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     # ── 6. PASSPORT NUMBER MUST NOT CONTAIN SPACES ───────────────────────────
     passport = fields.get("passport_number")
     if not _is_empty(passport):
-        assert passport is not None  # for type checker after _is_empty
+        assert passport is not None
         if PASSPORT_HAS_SPACE.search(passport):
             vr.add(
                 "passport_number", "error",
-                f"Passport number '{passport}' contains spaces — no passport format includes spaces",
+                f"Passport number '{passport}' contains spaces",
                 passport,
                 "Remove all spaces from the passport number",
                 penalty=0.3,
@@ -209,8 +226,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
         if not 6 <= len(passport.strip()) <= 15:
             vr.add(
                 "passport_number", "warning",
-                f"Passport number '{passport}' has unusual length ({len(passport.strip())} chars)"
-                " — most are 8–9 characters",
+                f"Passport number '{passport}' has unusual length ({len(passport.strip())} chars)",
                 passport,
                 "Verify against the physical document",
                 penalty=0.15,
@@ -224,14 +240,12 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
         if normalised not in VALID_VISA_CLASSIFICATIONS:
             vr.add(
                 "visa_classification", "error",
-                f"'{visa}' is not a recognised visa classification"
-                f" — closest match may be '{normalised}'",
+                f"'{visa}' is not a recognised visa classification",
                 visa,
                 "Correct to standard format e.g. 'H-1B' not 'H1B'",
                 penalty=0.25,
             )
         elif visa.strip().upper() != normalised:
-            # Recognised after normalisation — soft warning only
             vr.add(
                 "visa_classification", "warning",
                 f"'{visa}' should be formatted as '{normalised}'",
@@ -244,51 +258,51 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     visa_upper = (fields.get("visa_classification") or "").strip().upper()
     wage_raw = fields.get("annual_wage") or fields.get("salary")
     if not _is_empty(wage_raw):
-        wage = _parse_wage(wage_raw)  # type: ignore[arg-type]
+        assert wage_raw is not None
+        wage = _parse_wage(wage_raw)
         if wage is not None and wage > 0:
             is_h1b = "H-1B" in visa_upper or "H1B" in visa_upper
             if is_h1b and wage < H1B_MIN_WAGE_ANNUAL:
                 vr.add(
                     "annual_wage", "error",
-                    f"Wage ${wage:,.0f}/yr is below the H-1B DOL minimum of"
-                    f" ${H1B_MIN_WAGE_ANNUAL:,}. This will fail DOL review.",
+                    f"Wage ${wage:,.0f}/yr is below the H-1B DOL minimum",
                     str(wage_raw),
-                    "Verify — likely missing zeros (e.g. 80000 not 8000)",
+                    "Verify — likely missing zeros",
                     penalty=0.4,
                 )
             elif wage < IMPLAUSIBLY_LOW_WAGE:
                 vr.add(
                     "annual_wage", "error",
-                    f"Wage ${wage:,.0f}/yr is implausibly low for any US work visa",
+                    f"Wage ${wage:,.0f}/yr is implausibly low",
                     str(wage_raw),
-                    "Verify — likely extracted incorrectly (missing digits)",
+                    "Verify — likely extracted incorrectly",
                     penalty=0.35,
                 )
 
     # ── 9. COUNTRY NAMES MUST NOT CONTAIN DIGITS ─────────────────────────────
-    for cfield in ("nationality", "country_of_citizenship", "country_of_birth"):
+    for cfield in ("nationality", "country_of_citizenship", "country_of_birth", "beneficiary_country_of_birth", "beneficiary_country_of_citizenship"):
         cval = fields.get(cfield)
         if not _is_empty(cval):
             assert cval is not None
             if OBVIOUSLY_BAD_COUNTRY.search(cval):
                 vr.add(
                     cfield, "error",
-                    f"Country name '{cval}' contains digits — no country name contains numbers",
+                    f"Country name '{cval}' contains digits",
                     cval,
-                    "Remove digits — likely an OCR error merging adjacent fields",
+                    "Remove digits — likely OCR error",
                     penalty=0.3,
                 )
 
     # ── 10. FEIN FORMAT: XX-XXXXXXX ──────────────────────────────────────────
-    fein = fields.get("employer_fein")
+    fein = fields.get("employer_fein") or fields.get("petitioner_fein")
     if not _is_empty(fein):
         assert fein is not None
         if not FEIN_RE.match(fein.strip()):
             vr.add(
                 "employer_fein", "error",
-                f"FEIN '{fein}' does not match required format XX-XXXXXXX",
+                f"FEIN '{fein}' does not match format XX-XXXXXXX",
                 fein,
-                "Verify FEIN from W-2 or IRS documentation",
+                "Verify FEIN from W-2",
                 penalty=0.2,
             )
 
@@ -298,8 +312,7 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
     if pet and emp and pet != emp:
         vr.add(
             "petitioner_name", "warning",
-            f"Petitioner name '{fields.get('petitioner_name')}' differs from"
-            f" employer name '{fields.get('employer_name')}' — should match on I-129",
+            f"Petitioner name differs from employer name",
             str(fields.get("petitioner_name")),
             "Verify both fields refer to the same entity",
             penalty=0.1,
@@ -307,30 +320,23 @@ def validate_extraction(fields: dict[str, Optional[str]]) -> ValidationResult:
 
     # ── 12. GIVEN / FAMILY NAME SWAP DETECTION ───────────────────────────────
     full = (fields.get("applicant_name") or "").strip()
-    family = (fields.get("applicant_family_name") or "").strip()
-    given = (fields.get("applicant_given_name") or "").strip()
+    family = (fields.get("applicant_family_name") or fields.get("beneficiary_surname") or "").strip()
+    given = (fields.get("applicant_given_name") or fields.get("beneficiary_given_names") or "").strip()
     if full and family and given and family.lower() != given.lower():
         full_parts = [p.lower() for p in full.split()]
-        # Classic USCIS mistake: family name is the FIRST word on the form
-        # but should be the surname (last name).
-        # Flag if stored 'family' == first word and stored 'given' == last word.
         if full_parts and full_parts[0] == family.lower() and full_parts[-1] == given.lower():
             vr.add(
                 "applicant_family_name", "warning",
-                f"Family name '{family}' appears to be the first (given) name."
-                " On USCIS forms 'Family Name' means SURNAME (last name).",
+                f"Family name '{family}' appears to be the first (given) name",
                 family,
-                "Verify: 'Family Name' = surname. Check if given/family fields are swapped.",
+                "Verify if given/family fields are swapped",
                 penalty=0.15,
             )
 
     return vr
 
 
-# ── Private helpers ───────────────────────────────────────────────────────────
-
 def _parse_date(val: str) -> tuple[Optional[date], Optional[str]]:
-    """Try common date formats. Returns (date, None) on success or (None, msg) on failure."""
     val = val.strip()
     for fmt in (
         "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d",
@@ -345,8 +351,6 @@ def _parse_date(val: str) -> tuple[Optional[date], Optional[str]]:
 
 
 def _parse_wage(val: str) -> Optional[float]:
-    """Extract numeric value from strings like '$80,000', '80000/year', '80,000 per annum'."""
-    # Take only the part before any slash or 'per'
     trimmed = val.split("/")[0].split("per")[0].split("Per")[0]
     cleaned = re.sub(r"[^\d.]", "", trimmed)
     try:

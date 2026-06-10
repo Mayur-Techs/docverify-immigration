@@ -147,3 +147,34 @@ def test_invalid_json_returns_failure():
     result = _parse_response("not json at all {{{", "test")
     assert not result.success
     assert "json" in result.error
+
+from extractor.groq_engine import extract_fields_chunked
+from parser.extractor import extract_text_chunked
+
+def test_extract_text_chunked_overlap():
+    # Simulate a 10,000 char document
+    # With MAX_CHARS=8000 and OVERLAP=200, we expect 2 chunks
+    dummy_text = "A" * 10000
+    # Monkeypatch _extract_raw for the test
+    import parser.extractor as ext
+    ext._extract_raw = lambda path: (dummy_text, 5)
+    
+    chunks, pages = extract_text_chunked("dummy.pdf")
+    
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 8000
+    assert len(chunks[1]) == 2200  # 10000 - 8000 + 200 overlap
+    assert pages == 5
+
+def test_extract_fields_chunked_merges_data(mocker):
+    # Mock the API call to simulate finding data on page 2
+    mock_responses = [
+        '{"petitioner_name": null, "job_title": null}',  # Chunk 1: nothing
+        '{"petitioner_name": "Acme Corp", "job_title": "Engineer"}'  # Chunk 2: found
+    ]
+    mocker.patch("extractor.groq_engine._execute_groq_call", side_effect=[(r, False) for r in mock_responses])
+    
+    result = extract_fields_chunked(["chunk1", "chunk2"], "i129")
+    
+    assert result.get("petitioner_name") == "Acme Corp"
+    assert result.get("job_title") == "Engineer"

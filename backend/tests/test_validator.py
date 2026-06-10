@@ -163,3 +163,24 @@ def test_overall_penalty_applied():
         "visa_classification": "H-1B",
     })
     assert vr.overall_penalty > 0.5
+
+def test_valid_status_enum_ds():
+    """Ensure D/S is not falsely flagged as an invalid date."""
+    fields = {"status_expiry_date": "D/S"}
+    vr = validate_extraction(fields)
+    assert not vr.has_errors
+    assert vr.overall_penalty == 0.0
+
+def test_valid_status_enum_ds_with_period():
+    """Ensure D/S. with trailing punctuation passes."""
+    fields = {"validity_period_end": "D/S."}
+    vr = validate_extraction(fields)
+    assert not vr.has_errors
+    assert vr.overall_penalty == 0.0
+
+def test_valid_status_enum_proc():
+    """Ensure PROC (processing) passes without penalty."""
+    fields = {"status_expiry": "PROC"}
+    vr = validate_extraction(fields)
+    assert not vr.has_errors
+    assert vr.overall_penalty == 0.0
